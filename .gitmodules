@@ -7,6 +7,3 @@
 [submodule "chip"]
 	path = chip
 	url = https://github.com/kvasir-io/chip_atsamd21.git
-[submodule "build/chip"]
-	path = build/chip
-	url = https://github.com/kvasir-io/chip_atsamd21.git
