@@ -97,11 +97,15 @@ private:
         };
         v = std::clamp(v, 0_u16, 999_u16);
         std::array<char, 3> num{};
-        auto const          r = std::to_chars(begin(num), end(num), std::uint16_t(v));
-        std::transform(begin(num), r.ptr, begin(num), [](auto c) { return (c - '0') * 2_u; });
-        std::fill(r.ptr, end(num), 20);
+        auto const          r = std::next(
+          begin(num),
+          std::distance(
+            data(num),
+            std::to_chars(data(num), data(num) + size(num), std::uint16_t(v)).ptr));
+        std::transform(begin(num), r, begin(num), [](auto c) { return (c - '0') * 2_u; });
+        std::fill(r, end(num), 20);
         std::array<char, 3> num2{};
-        std::rotate_copy(begin(num), r.ptr, end(num), rbegin(num2));
+        std::rotate_copy(begin(num), r, end(num), rbegin(num2));
 
         std::array<std::byte, 3 * 2> data{};
         std::size_t const            dotIndex = dotpos_.value_or(num2.size());

@@ -2,7 +2,6 @@
 // need to be included first
 #include "cmake_git_version/version.hpp"
 #include "displayManager.hpp"
-#include "kvasir/Devices/I2CPowerManager.hpp"
 #include "kvasir/Devices/Max31865.hpp"
 #include "kvasir/Devices/pca9956b.hpp"
 #include "uc_log/uc_log.hpp"
@@ -43,7 +42,7 @@ int main() {
 
         if (currentTime > next) {
             std::uint16_t const temperature =
-                static_cast<std::uint16_t>(max31865.t().value_or(0) * 10_cnl2);
+                static_cast<std::uint16_t>(max31865.t().value_or(0) * 10.0f);
             display.set(temperature, 1);
 
             next += 100ms;
