@@ -1,123 +1,60 @@
 #pragma once
 
-#include "kvasir/Devices/pca9956b.hpp"
-#include "kvasir/Util/using_literals.hpp"
+#include "Units.hpp"
 
-#include <algorithm>
 #include <array>
-#include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <kvasir/Devices/I2C/Device.hpp>
+#include <kvasir/Devices/I2C/SegmentBackends.hpp>
+#include <kvasir/Devices/I2C/chips/Pca9956b.hpp>
 #include <optional>
-#include <utility>
+#include <string_view>
 
+/// The three digits on the PCA9956B: the temperature in tenths, the valve's position in
+/// percent or a word, steady or blinking. The glyphs, the wiring and the wire traffic are Kvasir::I2C::Pca9956bDisplay's.
 template<typename I2C, typename Clock>
 struct DisplayManager {
-    using tp = typename Clock::time_point;
+    /// 0x3F with a 2.2 k external resistor, as the board is built. Address and Rext used
+    /// to be constructor arguments (`display(0x3F, 2200)`); they are template parameters
+    /// of the chip description now, so the IREF arithmetic happens at compile time.
+    using Leds   = Kvasir::I2C::Chips::Pca9956b<0x3F, Kvasir::Units::ohm(2200)>;
+    using Device = Kvasir::I2C::Device<I2C, Clock, Leds>;
 
-    std::uint16_t               displayValue{};
-    std::optional<std::uint8_t> dotpos{};
+    Device                               display{};
+    Kvasir::I2C::Pca9956bDisplay<Device> digits{display, Kvasir::Units::milliAmp(5)};
 
-    Kvasir::Pca9956b<I2C, Clock> display;
+    DisplayManager()                                 = default;
+    DisplayManager(DisplayManager const&)            = delete;   // digits points at display
+    DisplayManager& operator=(DisplayManager const&) = delete;
 
-    static constexpr auto offTime{std::chrono::milliseconds{200}};
-    static constexpr auto onTime{std::chrono::milliseconds{400}};
-    static constexpr auto refreshRate{std::chrono::milliseconds{50}};
-    static_assert(offTime > refreshRate);
-    static_assert(onTime > refreshRate);
-
-    tp nextUpdate;
-    tp blinkUpdate;
-
-    bool displayOn{true};
-
-    enum class State { static_mode, blink_mode };
-
-    State st{State::static_mode};
-
-    explicit DisplayManager() : display(0x3F, 2200) {
-        display.setCurrentAll(5);
-        display.setPwmAll(255);
+    void blink(bool on) {
+        digits.blink(on ? Kvasir::SegmentDisplay::Blink::on : Kvasir::SegmentDisplay::Blink::off);
     }
 
-    void setBlinkMode() { st = State::blink_mode; }
+    /// Tenths of a degree, -9.9 to 99.9 and clamped to that; without a reading, dashes.
+    void showTemperature(std::optional<Units::Shown> temperature) {
+        if(temperature) {
+            digits.setNumber(Units::raw(*temperature), 1, Kvasir::SegmentDisplay::Overflow::clamp);
+        } else {
+            digits.dashes();
+        }
+    }
 
-    void setStaticMode() { st = State::static_mode; }
+    /// 0 to 100, without a point: what tells it from a temperature.
+    void showPercent(Units::Percent percent) { digits.setNumber(Units::raw(percent)); }
+
+    /// Three characters SegmentDisplay::glyph() has: "CAL", "Err".
+    void showText(std::string_view text) {
+        std::array<Kvasir::SegmentDisplay::Glyph, 3> glyphs{};
+        for(std::size_t i = 0; i < glyphs.size() && i < text.size(); ++i) {
+            glyphs[i] = Kvasir::SegmentDisplay::glyph(text[i]);
+        }
+        digits.setDigits(glyphs);
+    }
 
     void handler() {
-        auto now{Clock::now()};
-        if(now > nextUpdate) {
-            setNum(displayValue, dotpos);
-            switch(st) {
-            case State::static_mode:
-                {
-                    displayOn = true;
-                    display.setPwmAll(255);
-                }
-                break;
-
-            case State::blink_mode:
-                {
-                    if(now > blinkUpdate) {
-                        if(displayOn) {
-                            displayOn = false;
-                            display.setPwmAll(0);
-                            blinkUpdate = now + offTime;
-                        } else {
-                            displayOn = true;
-                            display.setPwmAll(255);
-                            blinkUpdate = now + onTime;
-                        }
-                    }
-                }
-                break;
-            }
-            nextUpdate = now + refreshRate;
-        }
+        digits.update(Clock::now());
         display.handler();
-    }
-
-    void set(std::uint16_t v, std::optional<std::uint8_t> dotpos_) {
-        displayValue = v;
-        dotpos       = dotpos_;
-    }
-
-private:
-    void setNum(std::uint16_t v, std::optional<std::uint8_t> dotpos_) {
-        static constexpr std::array numbers{
-          0xFC_b, 0xFC_b,   // 0
-          0xC0_b, 0x0C_b,   // 1
-          0xF3_b, 0xF0_b,   // 2
-          0xF3_b, 0x3C_b,   // 3
-          0xCF_b, 0x0C_b,   // 4
-          0x3F_b, 0x3C_b,   // 5
-          0x3F_b, 0xFC_b,   // 6
-          0xF0_b, 0x0C_b,   // 7
-          0xFF_b, 0xFC_b,   // 8
-          0xFF_b, 0x3C_b,   // 9
-          0x00_b, 0x00_b,   // space
-        };
-        v = std::clamp(v, 0_u16, 999_u16);
-        std::array<char, 3> num{};
-        auto const          r = std::next(
-          begin(num),
-          std::distance(
-            data(num),
-            std::to_chars(data(num), data(num) + size(num), std::uint16_t(v)).ptr));
-        std::transform(begin(num), r, begin(num), [](auto c) { return (c - '0') * 2_u; });
-        std::fill(r, end(num), 20);
-        std::array<char, 3> num2{};
-        std::rotate_copy(begin(num), r, end(num), rbegin(num2));
-
-        std::array<std::byte, 3 * 2> data{};
-        std::size_t const            dotIndex = dotpos_.value_or(num2.size());
-        for(std::size_t o{}, n{}; o < data.size(); o += 2, ++n) {
-            data[o]     = numbers[num2[n]];
-            data[o + 1] = std::byte(std::size_t(numbers[num2[n] + 1]) + (dotIndex == n ? 3 : 0));
-        }
-        display.setLedOut(data);
-    }
-
-    void clear() {
-        std::array<std::byte, 3 * 2> data{0x00_b, 0x00_b, 0x00_b, 0x00_b, 0x00_b, 0x00_b};
-        display.setLedOut(data);
     }
 };

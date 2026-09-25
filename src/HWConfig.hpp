@@ -9,10 +9,20 @@ struct DbgPres {
 #include "uc_log/DefaultRttComBackend.hpp"
 
 namespace uc_log {
+// A record from an ISR is written with interrupts masked (IsrPolicy::MaskedRecord), so ISRs at
+// different priority levels share the ISR buffer; Startup refuses that mix of levels otherwise.
 template<>
 struct ComBackend<uc_log::Tag::User>
-  : public uc_log::DefaultRttComBackend<DbgPres, 1024, 256, rtt::BufferMode::skip> {};
+  : public uc_log::DefaultRttComBackend<DbgPres,
+                                        1024,
+                                        256,
+                                        rtt::BufferMode::skip,
+                                        // "control": Protocol.hpp, see Remote.hpp. uc_log_printer
+                                        // puts it on a socket, duplex.0.sock, for tui/.
+                                        DuplexChannels<DuplexChannelConfig<"control", 256, 128>>,
+                                        IsrPolicy::MaskedRecord> {};
 }   // namespace uc_log
+
 // need to be included first
 
 #include "chip/Interrupt.hpp"
@@ -24,6 +34,7 @@ static constexpr auto ClockSpeed     = 48'000'000;
 static constexpr auto I2CClockDivide = 32;
 static constexpr auto EICClockDivide = 4096;
 static constexpr auto SPIClockDivide = 2;
+static constexpr auto WDTClockDivide = 32;   // OSCULP32K down to the 1.024 kHz the WDT counts
 
 struct SystickClockConfig {
     static constexpr auto clockBase = Kvasir::Systick::useProcessorClock;
@@ -41,14 +52,19 @@ struct LogClock<uc_log::Tag::User> : public HW::SystickClock {};
 }   // namespace uc_log
 
 #include "chip/chip.hpp"
+#include "kvasir/Devices/Quantities.hpp"
 
+/// Logging goes out over RTT only while a debugger is attached.
 inline bool dbgpres() {
-    return true;
     return apply(read(Kvasir::Peripheral::DSU::Registers<>::STATUSB::dbgpres));
 }
 
 namespace HW {
 using ComBackend = uc_log::ComBackend<uc_log::Tag::User>;
+
+/// The RTD on the MAX31865 and the reference resistor next to it.
+static constexpr auto RtdNominal   = Kvasir::Units::ohm(500);
+static constexpr auto RtdReference = Kvasir::Units::ohm(1000);
 
 namespace Pin {
     using ac1 = decltype(makePinLocation(Kvasir::Io::portA, Kvasir::Io::pin2));
@@ -81,39 +97,31 @@ struct ClockSettings {
         using Kvasir::Register::value;
 
         using namespace Kvasir::GCLK;
-        using KSR                              = Kvasir::Peripheral::SYSCTRL::Registers<>;
         using KNR                              = Kvasir::Peripheral::NVMCTRL::Registers<>;
         static constexpr auto flash_waitstates = KNR::CTRLB::RWSVal::half;
 
         static constexpr auto GENDIV_div = 0;
-        apply(KSR::DFLLCTRL::overrideDefaults(
-          set(KSR::DFLLCTRL::enable),
-          clear(KSR::DFLLCTRL::ondemand)));
 
-        while(!apply(read(KSR::PCLKSR::dfllrdy))) {
-        }
+        // 48 MHz from the DFLL in open loop, on the coarse value the factory measured for
+        // this part.
+        Kvasir::DFLL::enableOpenLoop();
 
-        apply(
-          write(KSR::DFLLVAL::fine, 0),
-          write(KSR::DFLLVAL::diff, 0),
-          write(KSR::DFLLVAL::coarse, value<37>()));
-
-        apply(
-          KNR::CTRLB::overrideDefaults(
-            write(KNR::CTRLB::rws, value<KNR::CTRLB::RWSVal, flash_waitstates>())),
-          GenericClockGenerator<0, GeneratorSource::dfll48m, GENDIV_div>::enable());
+        apply(KNR::CTRLB::overrideDefaults(
+                write(KNR::CTRLB::rws, value<KNR::CTRLB::RWSVal, flash_waitstates>())),
+              GenericClockGenerator<0, GeneratorSource::dfll48m, GENDIV_div>::enable());
     }
 
     static void peripheryClockInit() {
         using Kvasir::Register::value;
         using namespace Kvasir::GCLK;
-        apply(
-          GenericClockGenerator<1, GeneratorSource::dfll48m, I2CClockDivide>::enable(),
-          GenericClockGenerator<2, GeneratorSource::dfll48m, SPIClockDivide>::enable(),
-          GenericClockGenerator<3, GeneratorSource::dfll48m, EICClockDivide>::enable(),
-          PeripheralChannelController<1, Peripheral::sercom0_core>::enable(),
-          PeripheralChannelController<2, Peripheral::sercom3_core>::enable(),
-          PeripheralChannelController<3, Peripheral::eic>::enable());
+        apply(GenericClockGenerator<1, GeneratorSource::dfll48m, I2CClockDivide>::enable(),
+              GenericClockGenerator<2, GeneratorSource::dfll48m, SPIClockDivide>::enable(),
+              GenericClockGenerator<3, GeneratorSource::dfll48m, EICClockDivide>::enable(),
+              GenericClockGenerator<4, GeneratorSource::osculp32k, WDTClockDivide>::enable(),
+              PeripheralChannelController<1, Peripheral::sercom0_core>::enable(),
+              PeripheralChannelController<2, Peripheral::sercom3_core>::enable(),
+              PeripheralChannelController<3, Peripheral::eic>::enable(),
+              PeripheralChannelController<4, Peripheral::wdt>::enable());
     }
 };
 
@@ -140,6 +148,33 @@ struct SPIConfig {
     static constexpr auto isrPriority     = 1;
 };
 
+/// The watchdog: CONFIG.PER 0x8 is 2048 cycles of GCLK_WDT (datasheet DS40001882, WDT
+/// CONFIG), which generator 4 makes 32.768 kHz / 32 = 1.024 kHz of the OSCULP32K, so 2 s --
+/// give or take that oscillator's accuracy. A main loop that stops turning lets go of the
+/// relays through the reset (the pins are inputs again). "When the CPU is halted in debug
+/// mode the WDT will halt normal operation" (WDT, Debug Operation). Not always-on, so a
+/// reset -- flashing included -- starts without it.
+struct Watchdog {
+    using Regs = Kvasir::Peripheral::WDT::Registers<>;
+
+    static void sync() {
+        while(apply(read(Regs::STATUS::syncbusy))) {}
+    }
+
+    static void init() {
+        apply(write(Regs::CONFIG::PERValC::_2k));
+        sync();
+        apply(set(Regs::CTRLA::enable));
+        sync();
+    }
+
+    /// From the main loop only. A clear while the last one still synchronises is dropped:
+    /// the next turn brings another.
+    static void handler() {
+        if(!apply(read(Regs::STATUS::syncbusy))) { apply(write(Regs::CLEAR::CLEARValC::key)); }
+    }
+};
+
 struct Fault_CleanUpAction {
     void operator()() {
         apply(clear(Pin::relay1{}, Pin::relay2{}, Pin::relay3{}, Pin::relay4{}, Pin::led{}));
@@ -147,17 +182,16 @@ struct Fault_CleanUpAction {
 };
 
 struct PinConfig {
-    static constexpr auto initStepPinConfig = list(
-      makeOutput(HW::Pin::relay1{}),
-      makeOutput(HW::Pin::relay2{}),
-      makeOutput(HW::Pin::relay3{}),
-      makeOutput(HW::Pin::relay4{}),
-      makeOutput(HW::Pin::led{}),
-      makeInput(HW::Pin::ac1{}),
-      makeInput(HW::Pin::ac2{}),
-      makeInput(HW::Pin::ac3{}),
-      makeInput(HW::Pin::ac4{}),
-      set(HW::Pin::led{}));
+    static constexpr auto initStepPinConfig = list(makeOutput(HW::Pin::relay1{}),
+                                                   makeOutput(HW::Pin::relay2{}),
+                                                   makeOutput(HW::Pin::relay3{}),
+                                                   makeOutput(HW::Pin::relay4{}),
+                                                   makeOutput(HW::Pin::led{}),
+                                                   makeInput(HW::Pin::ac1{}),
+                                                   makeInput(HW::Pin::ac2{}),
+                                                   makeInput(HW::Pin::ac3{}),
+                                                   makeInput(HW::Pin::ac4{}),
+                                                   set(HW::Pin::led{}));
 };
 
 }   // namespace HW
